@@ -45,7 +45,7 @@ jobs:
           mkdir -p ~/tools && cd ~/tools
           
           # Download ProjectDiscovery tools
-          for tool in "subfinder:2.8.0" "httpx:1.7.1" "nuclei:3.4.10" "katana:1.2.1"; do
+          for tool in "subfinder:2.8.0" "httpx:1.7.1" "nuclei:3.4.10" "katana:1.2.1" "naabu:2.3.1" "alterx:0.0.4"; do
             name=${tool%:*}
             ver=${tool#*:}
             wget -q "https://github.com/projectdiscovery/$name/releases/download/v${ver}/${name}_${ver}_linux_amd64.zip"
@@ -68,6 +68,8 @@ jobs:
           ~/tools/httpx -version
           ~/tools/nuclei -version
           ~/tools/katana -version
+          ~/tools/naabu -version
+          ~/tools/alterx -version
           ~/tools/notify -version
           
       - name: Cache templates
