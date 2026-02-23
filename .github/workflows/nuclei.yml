@@ -108,6 +108,9 @@ jobs:
           echo "Input file: upload/${{ inputs.file_name }} ($(wc -l < upload/${{ inputs.file_name }}) lines)"
           
       - name:  Execute scan
+        env:
+          TELEGRAM_API_KEY: ${{ secrets.TELEGRAM_API_KEY }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           FILE="upload/${{ inputs.file_name }}"
           CMD="${{ inputs.command }}"
@@ -119,11 +122,22 @@ jobs:
           if [[ "$MODE" == "bulk" ]]; then
             cat "$FILE" | eval "$CMD" > "$BULK" && {
               [[ -s "$BULK" ]] && {
-                echo "Results: $(wc -l < $BULK) lines"
-                notify -pc notify.yml -silent -data "$BULK" || echo "Notify failed"
-              } || echo "ℹ️ No results" | notify -pc notify.yml -silent
+                LINES=$(wc -l < "$BULK")
+                echo "Results: $LINES lines"
+                # Send file as document to Telegram
+                curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_API_KEY}/sendDocument" \
+                  -F "chat_id=${TELEGRAM_CHAT_ID}" \
+                  -F "document=@${BULK}" \
+                  -F "caption=✅ Scan completed: ${LINES} results" && echo "File sent to Telegram"
+              } || {
+                curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_API_KEY}/sendMessage" \
+                  -d "chat_id=${TELEGRAM_CHAT_ID}" \
+                  -d "text=ℹ️ No results found"
+              }
             } || {
-              echo "❌ Scan failed" | notify -pc notify.yml -silent
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_API_KEY}/sendMessage" \
+                -d "chat_id=${TELEGRAM_CHAT_ID}" \
+                -d "text=❌ Scan failed"
               exit 1
             }
           else
