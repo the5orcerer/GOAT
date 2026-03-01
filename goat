@@ -1,8 +1,15 @@
 #!/bin/bash
 
-GITHUB_TOKEN="GITHUB_TOKEN" # Set your GitHub token here or export it in your environment
-GITHUB_REPO="GITHUB_REPO" # Set your GitHub repository in the format owner/repo
+GITHUB_TOKEN="${GITHUB_TOKEN:-}"
+GITHUB_REPO="${GITHUB_REPO:-}"
 GITHUB_API="https://api.github.com"
+GOAT_RAW_URL="https://raw.githubusercontent.com/the5orcerer/GOAT/main/goat"
+VERSION="$(cat "$(dirname "$(realpath "$0")")/version.txt" 2>/dev/null || echo "1.13.57")"
+VERBOSE=false
+
+verbose() {
+  $VERBOSE && echo "[DEBUG] $*" >&2
+}
 
 show_help() {
   cat <<EOF
@@ -13,6 +20,11 @@ Commands:
   status            Show running workflows and worker count
   delete <run_id>   Cancel a running workflow by its ID
   show <run_id>     Stream workflow logs to stdout
+  update            Download and install the latest version of goat
+
+Global options:
+  -v, --version     Show current version and exit
+  --verbose         Enable verbose/debug output
 
 Run options (used with 'run' or legacy mode):
   -f <filename>       Input file (required)
@@ -20,13 +32,18 @@ Run options (used with 'run' or legacy mode):
   -m <mode>           Notification mode: line|bulk (default: line)
   -b <bulk_filename>  Output filename for bulk mode (default: results.txt)
 
+Environment variables:
+  GITHUB_TOKEN      GitHub personal access token (required)
+  GITHUB_REPO       GitHub repository in the format owner/repo (required)
+
 Examples:
   goat run -f domains.txt -c "subfinder -silent | httpx -silent"
   goat run -f urls.txt -c "katana -silent -d 2" -m bulk -b crawled.txt
-  goat run -f domains.txt -c "subfinder -silent | httpx -silent"
   goat status
   goat delete 12345678
   goat show 12345678
+  goat update
+  sudo goat update
 
 Available tools: subfinder, httpx, nuclei, katana, notify, gau, waybackurls, hakrawler, alterx, naabu
 EOF
@@ -238,6 +255,52 @@ cmd_run() {
   [[ "$notification_mode" == "bulk" ]] && echo "→ Results will be in $bulk_filename"
 }
 
+cmd_update() {
+  command -v curl &>/dev/null || { echo "Error: curl not installed"; exit 1; }
+
+  echo "→ Fetching latest goat from $GOAT_RAW_URL ..."
+
+  tmp_file=$(mktemp)
+  trap "rm -f \"$tmp_file\"" EXIT
+
+  http_code=$(curl -s -w "%{http_code}" -o "$tmp_file" "$GOAT_RAW_URL")
+  if [[ "$http_code" != "200" ]]; then
+    echo "Error: Failed to download goat (HTTP $http_code)"
+    exit 1
+  fi
+
+  verbose "Downloaded $(wc -c < "$tmp_file") bytes"
+
+  if [[ $EUID -eq 0 ]]; then
+    install_dir="/usr/local/bin"
+  else
+    install_dir="$HOME/.local/bin"
+    mkdir -p "$install_dir"
+  fi
+
+  install_path="$install_dir/goat"
+  verbose "Installing to $install_path"
+
+  cp "$tmp_file" "$install_path" || { echo "Error: Failed to install goat to $install_path"; exit 1; }
+  chmod +x "$install_path"
+
+  echo "✓ goat updated and installed to $install_path"
+
+  # Show installed version if possible
+  new_version=$("$install_path" --version 2>/dev/null | grep -oE '[0-9.]+' | head -1 || true)
+  [[ -n "$new_version" ]] && echo "→ Version: $new_version"
+}
+
+# Parse and strip global flags before subcommand dispatch
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    --verbose) VERBOSE=true ;;
+    *) args+=("$arg") ;;
+  esac
+done
+set -- "${args[@]}"
+
 # Subcommand dispatch — first arg determines mode
 case "$1" in
   status)
@@ -255,6 +318,13 @@ case "$1" in
   run)
     shift
     cmd_run "$@"
+    ;;
+  update)
+    shift
+    cmd_update "$@"
+    ;;
+  -v|--version)
+    echo "goat version $VERSION"
     ;;
   -h|--help)
     show_help
