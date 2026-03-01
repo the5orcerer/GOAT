@@ -21,15 +21,14 @@ Run options (used with 'run' or legacy mode):
   -b <bulk_filename>  Output filename for bulk mode (default: results.txt)
 
 Examples:
-  $0 -f domains.txt -c "subfinder -silent | httpx -silent"
-  $0 -f urls.txt -c "katana -silent -d 2" -m bulk -b crawled.txt
-  $0 run -f domains.txt -c "subfinder -silent | httpx -silent"
-  $0 status
-  $0 delete 12345678
-  $0 show 12345678
-  $0 show 12345678 | grep error
+  goat run -f domains.txt -c "subfinder -silent | httpx -silent"
+  goat run -f urls.txt -c "katana -silent -d 2" -m bulk -b crawled.txt
+  goat run -f domains.txt -c "subfinder -silent | httpx -silent"
+  goat status
+  goat delete 12345678
+  goat show 12345678
 
-Available tools: subfinder, httpx, nuclei, katana, notify
+Available tools: subfinder, httpx, nuclei, katana, notify, gau, waybackurls, hakrawler, alterx, naabu
 EOF
 }
 
