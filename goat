@@ -4,125 +4,264 @@ GITHUB_TOKEN="GITHUB_TOKEN" # Set your GitHub token here or export it in your en
 GITHUB_REPO="GITHUB_REPO" # Set your GitHub repository in the format owner/repo
 GITHUB_API="https://api.github.com"
 
-file=""
-command=""
-notification_mode="line"
-bulk_filename="results.txt"
-
 show_help() {
   cat <<EOF
-Usage: $0 -f <filename> -c <command> [-m line|bulk] [-b bulk_filename]
+Usage: $0 [COMMAND] [OPTIONS]
 
-Options:
+Commands:
+  run               Trigger a new workflow (default if no command specified)
+  status            Show running workflows and worker count
+  delete <run_id>   Cancel a running workflow by its ID
+  show <run_id>     Stream workflow logs to stdout
+
+Run options (used with 'run' or legacy mode):
   -f <filename>       Input file (required)
   -c <command>        Command to execute (required)
-  -m <mode>           Notification mode: line|bulk (default:  line)
+  -m <mode>           Notification mode: line|bulk (default: line)
   -b <bulk_filename>  Output filename for bulk mode (default: results.txt)
 
 Examples:
   $0 -f domains.txt -c "subfinder -silent | httpx -silent"
-  $0 -f urls.txt -c "katana -silent -d 2" -m bulk -b crawled. txt
+  $0 -f urls.txt -c "katana -silent -d 2" -m bulk -b crawled.txt
+  $0 run -f domains.txt -c "subfinder -silent | httpx -silent"
+  $0 status
+  $0 delete 12345678
+  $0 show 12345678
+  $0 show 12345678 | grep error
 
-Available tools:  subfinder, httpx, nuclei, katana, notify
+Available tools: subfinder, httpx, nuclei, katana, notify
 EOF
 }
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -f) file="$2"; shift 2 ;;
-    -c) command="$2"; shift 2 ;;
-    -m) notification_mode="$2"; shift 2 ;;
-    -b) bulk_filename="$2"; shift 2 ;;
-    -h|--help) show_help; exit 0 ;;
-    *) echo "Error: Unknown argument: $1"; show_help; exit 1 ;;
-  esac
-done
+cmd_status() {
+  [[ -z "$GITHUB_TOKEN" ]] && { echo "Error: GITHUB_TOKEN not set"; exit 1; }
+  command -v jq &>/dev/null || { echo "Error: jq not installed"; exit 1; }
 
-[[ -z "$file" ]] && { echo "Error: Input file required (-f)"; show_help; exit 1; }
-[[ -z "$command" ]] && { echo "Error: Command required (-c)"; show_help; exit 1; }
-[[ !  -f "$file" ]] && { echo "Error: File not found:  $file"; exit 1; }
-[[ "$notification_mode" != "line" && "$notification_mode" != "bulk" ]] && { echo "Error: Invalid mode: $notification_mode"; exit 1; }
-[[ -z "$GITHUB_TOKEN" ]] && { echo "Error: GITHUB_TOKEN not set"; exit 1; }
+  echo "Fetching running workflows..."
 
-command -v jq &>/dev/null || { echo "Error: jq not installed"; exit 1; }
+  in_progress=$(curl -s \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    "$GITHUB_API/repos/$GITHUB_REPO/actions/runs?status=in_progress&per_page=100")
 
-filename=$(basename "$file")
-file_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
-max_size=$((18 * 1024 * 1024))
+  queued=$(curl -s \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    "$GITHUB_API/repos/$GITHUB_REPO/actions/runs?status=queued&per_page=100")
 
-[[ $file_size -gt $max_size ]] && { echo "Error: File too large (max 18MB)"; exit 1; }
+  echo ""
+  printf "%-15s %-12s %-35s %-25s %-12s\n" "RUN ID" "STATUS" "WORKFLOW" "STARTED AT" "CONCLUSION"
+  printf "%-15s %-12s %-35s %-25s %-12s\n" "---------------" "------------" "-----------------------------------" "-------------------------" "------------"
 
-echo "→ Uploading $filename ($(( file_size / 1024 ))KB)"
-echo "→ Command: $command"
-echo "→ Mode: $notification_mode"
+  total=0
 
-sha_response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-  "$GITHUB_API/repos/$GITHUB_REPO/contents/upload/$filename")
+  for payload in "$in_progress" "$queued"; do
+    count=$(echo "$payload" | jq -r '.workflow_runs | length' 2>/dev/null)
+    [[ "$count" -eq 0 ]] && continue
+    total=$(( total + count ))
+    echo "$payload" | jq -r '.workflow_runs[] | [(.id | tostring), .status, .name, .created_at, (.conclusion // "—")] | @tsv' 2>/dev/null | \
+      while IFS=$'\t' read -r id status name started conclusion; do
+        printf "%-15s %-12s %-35s %-25s %-12s\n" "$id" "$status" "${name:0:34}" "${started:0:24}" "$conclusion"
+      done
+  done
 
-sha=""
-if echo "$sha_response" | jq -e '.sha' >/dev/null 2>&1; then
-  sha=$(echo "$sha_response" | jq -r '.sha')
-  echo "→ Overwriting existing file"
-fi
-
-temp_json=$(mktemp)
-temp_b64=$(mktemp)
-trap "rm -f $temp_json $temp_b64" EXIT
-
-base64 -w 0 "$file" > "$temp_b64"
-
-{
-  echo '{'
-  echo "  \"message\": \"Upload $filename\","
-  echo -n "  \"content\": \""
-  cat "$temp_b64"
-  echo "\""
-  [[ -n "$sha" ]] && echo ",  \"sha\":  \"$sha\""
-  echo '}'
-} > "$temp_json"
-
-upload_response=$(curl -s -X PUT \
-  -H "Authorization: token $GITHUB_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d @"$temp_json" \
-  "$GITHUB_API/repos/$GITHUB_REPO/contents/upload/$filename")
-
-echo "$upload_response" | jq -e '.content' >/dev/null 2>&1 || {
-  echo "Error: Upload failed"
-  echo "$upload_response" | jq '.' 2>/dev/null || echo "$upload_response"
-  exit 1
+  echo ""
+  echo "Active workers: $total"
 }
 
-echo "✓ File uploaded"
+cmd_delete() {
+  local run_id="$1"
+  [[ -z "$run_id" ]] && { echo "Error: run_id required"; echo "Usage: $0 delete <run_id>"; exit 1; }
+  [[ -z "$GITHUB_TOKEN" ]] && { echo "Error: GITHUB_TOKEN not set"; exit 1; }
+  command -v jq &>/dev/null || { echo "Error: jq not installed"; exit 1; }
 
-workflow_payload="{
+  run_info=$(curl -s \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    "$GITHUB_API/repos/$GITHUB_REPO/actions/runs/$run_id")
+
+  if ! echo "$run_info" | jq -e '.id' >/dev/null 2>&1; then
+    echo "Error: Workflow run $run_id not found"
+    exit 1
+  fi
+
+  run_name=$(echo "$run_info" | jq -r '.name')
+  run_status=$(echo "$run_info" | jq -r '.status')
+  echo "Run ID:  $run_id"
+  echo "Name:    $run_name"
+  echo "Status:  $run_status"
+  echo ""
+  read -r -p "Cancel this workflow run? [y/N] " confirm
+  [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { echo "Aborted."; exit 0; }
+
+  cancel_response=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    "$GITHUB_API/repos/$GITHUB_REPO/actions/runs/$run_id/cancel")
+
+  if [[ "$cancel_response" == "202" ]]; then
+    echo "✓ Workflow run $run_id cancelled"
+  else
+    echo "Error: Failed to cancel run $run_id (HTTP $cancel_response)"
+    exit 1
+  fi
+}
+
+cmd_show() {
+  local run_id="$1"
+  [[ -z "$run_id" ]] && { echo "Error: run_id required"; echo "Usage: $0 show <run_id>"; exit 1; }
+  [[ -z "$GITHUB_TOKEN" ]] && { echo "Error: GITHUB_TOKEN not set"; exit 1; }
+  command -v jq &>/dev/null || { echo "Error: jq not installed"; exit 1; }
+
+  jobs_response=$(curl -s \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    "$GITHUB_API/repos/$GITHUB_REPO/actions/runs/$run_id/jobs")
+
+  if ! echo "$jobs_response" | jq -e '.jobs' >/dev/null 2>&1; then
+    echo "Error: Could not retrieve jobs for run $run_id" >&2
+    exit 1
+  fi
+
+  job_count=$(echo "$jobs_response" | jq '.jobs | length')
+  if [[ "$job_count" -eq 0 ]]; then
+    echo "No jobs found for run $run_id (workflow may still be queued)" >&2
+    exit 1
+  fi
+
+  echo "$jobs_response" | jq -r '.jobs[].id' | while read -r job_id; do
+    log_response=$(curl -s -L \
+      -H "Authorization: token $GITHUB_TOKEN" \
+      "$GITHUB_API/repos/$GITHUB_REPO/actions/jobs/$job_id/logs")
+    echo "$log_response"
+  done
+}
+
+cmd_run() {
+  local file=""
+  local cmd=""
+  local notification_mode="line"
+  local bulk_filename="results.txt"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f) file="$2"; shift 2 ;;
+      -c) cmd="$2"; shift 2 ;;
+      -m) notification_mode="$2"; shift 2 ;;
+      -b) bulk_filename="$2"; shift 2 ;;
+      -h|--help) show_help; exit 0 ;;
+      *) echo "Error: Unknown argument: $1"; show_help; exit 1 ;;
+    esac
+  done
+
+  [[ -z "$file" ]] && { echo "Error: Input file required (-f)"; show_help; exit 1; }
+  [[ -z "$cmd" ]] && { echo "Error: Command required (-c)"; show_help; exit 1; }
+  [[ ! -f "$file" ]] && { echo "Error: File not found: $file"; exit 1; }
+  [[ "$notification_mode" != "line" && "$notification_mode" != "bulk" ]] && { echo "Error: Invalid mode: $notification_mode"; exit 1; }
+  [[ -z "$GITHUB_TOKEN" ]] && { echo "Error: GITHUB_TOKEN not set"; exit 1; }
+
+  command -v jq &>/dev/null || { echo "Error: jq not installed"; exit 1; }
+
+  filename=$(basename "$file")
+  file_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
+  max_size=$((18 * 1024 * 1024))
+
+  [[ $file_size -gt $max_size ]] && { echo "Error: File too large (max 18MB)"; exit 1; }
+
+  echo "→ Uploading $filename ($(( file_size / 1024 ))KB)"
+  echo "→ Command: $cmd"
+  echo "→ Mode: $notification_mode"
+
+  sha_response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+    "$GITHUB_API/repos/$GITHUB_REPO/contents/upload/$filename")
+
+  sha=""
+  if echo "$sha_response" | jq -e '.sha' >/dev/null 2>&1; then
+    sha=$(echo "$sha_response" | jq -r '.sha')
+    echo "→ Overwriting existing file"
+  fi
+
+  temp_json=$(mktemp)
+  temp_b64=$(mktemp)
+  trap "rm -f $temp_json $temp_b64" EXIT
+
+  base64 -w 0 "$file" > "$temp_b64"
+
+  {
+    echo '{'
+    echo "  \"message\": \"Upload $filename\","
+    echo -n "  \"content\": \""
+    cat "$temp_b64"
+    echo "\""
+    [[ -n "$sha" ]] && echo ", \"sha\": \"$sha\""
+    echo '}'
+  } > "$temp_json"
+
+  upload_response=$(curl -s -X PUT \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d @"$temp_json" \
+    "$GITHUB_API/repos/$GITHUB_REPO/contents/upload/$filename")
+
+  echo "$upload_response" | jq -e '.content' >/dev/null 2>&1 || {
+    echo "Error: Upload failed"
+    echo "$upload_response" | jq '.' 2>/dev/null || echo "$upload_response"
+    exit 1
+  }
+
+  echo "✓ File uploaded"
+
+  workflow_payload="{
   \"ref\": \"main\",
-  \"inputs\":  {
+  \"inputs\": {
     \"file_name\": \"$filename\",
-    \"command\": \"$command\",
+    \"command\": \"$cmd\",
     \"notification_mode\": \"$notification_mode\""
 
-[[ "$notification_mode" == "bulk" ]] && workflow_payload+=",
+  [[ "$notification_mode" == "bulk" ]] && workflow_payload+=",
     \"bulk_filename\": \"$bulk_filename\""
 
-workflow_payload+="
+  workflow_payload+="
   }
 }"
 
-echo "→ Triggering workflow..."
+  echo "→ Triggering workflow..."
 
-workflow_response=$(curl -s -X POST \
-  -H "Authorization: token $GITHUB_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "$workflow_payload" \
-  "$GITHUB_API/repos/$GITHUB_REPO/actions/workflows/nuclei.yml/dispatches")
+  workflow_response=$(curl -s -X POST \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$workflow_payload" \
+    "$GITHUB_API/repos/$GITHUB_REPO/actions/workflows/nuclei.yml/dispatches")
 
-[[ -z "$workflow_response" ]] || {
-  echo "Error:  Workflow trigger failed"
-  echo "$workflow_response" | jq '.' 2>/dev/null || echo "$workflow_response"
-  exit 1
+  [[ -z "$workflow_response" ]] || {
+    echo "Error: Workflow trigger failed"
+    echo "$workflow_response" | jq '.' 2>/dev/null || echo "$workflow_response"
+    exit 1
+  }
+
+  echo "✓ Workflow triggered"
+  echo "→ Monitor: https://github.com/$GITHUB_REPO/actions"
+  [[ "$notification_mode" == "bulk" ]] && echo "→ Results will be in $bulk_filename"
 }
 
-echo "✓ Workflow triggered"
-echo "→ Monitor:  https://github.com/$GITHUB_REPO/actions"
-[[ "$notification_mode" == "bulk" ]] && echo "→ Results will be in $bulk_filename"
+# Subcommand dispatch — first arg determines mode
+case "$1" in
+  status)
+    shift
+    cmd_status "$@"
+    ;;
+  delete)
+    shift
+    cmd_delete "$@"
+    ;;
+  show)
+    shift
+    cmd_show "$@"
+    ;;
+  run)
+    shift
+    cmd_run "$@"
+    ;;
+  -h|--help)
+    show_help
+    ;;
+  *)
+    # Legacy flag-based mode for backward compatibility
+    cmd_run "$@"
+    ;;
+esac
