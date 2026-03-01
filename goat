@@ -32,10 +32,6 @@ Run options (used with 'run' or legacy mode):
   -m <mode>           Notification mode: line|bulk (default: line)
   -b <bulk_filename>  Output filename for bulk mode (default: results.txt)
 
-Environment variables:
-  GITHUB_TOKEN      GitHub personal access token (required)
-  GITHUB_REPO       GitHub repository in the format owner/repo (required)
-
 Examples:
   goat run -f domains.txt -c "subfinder -silent | httpx -silent"
   goat run -f urls.txt -c "katana -silent -d 2" -m bulk -b crawled.txt
