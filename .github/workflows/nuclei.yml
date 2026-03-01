@@ -1,16 +1,15 @@
 name: Security Scanning Pipeline
-
 on:
-  workflow_dispatch: 
-    inputs: 
+  workflow_dispatch:
+    inputs:
       file_name:
         required: true
         type: string
-        description: "Input file name"
+        description: "Input file name (domains / wildcards, one per line)"
       command:
         required: true
         type: string
-        description: "Command to execute"
+        description: "Command to execute (e.g. 'httpx -silent | nuclei ...')"
       notification_mode:
         required: false
         type: choice
@@ -22,29 +21,29 @@ on:
       bulk_filename:
         required: false
         type: string
-        default:  "results.txt"
+        default: "results.txt"
         description: "Output filename for bulk mode"
 
 jobs:
-  scan: 
+  scan:
     runs-on: ubuntu-latest
-    
+   
     steps:
-      - uses:  actions/checkout@v4
-          
+      - uses: actions/checkout@v4
+         
       - name: Cache tools
         id: cache-tools
         uses: actions/cache@v4
         with:
-          path:  ~/tools
+          path: ~/tools
           key: pdtools-v2-${{ runner.os }}
-          
+         
       - name: Install tools
         if: steps.cache-tools.outputs.cache-hit != 'true'
         run: |
           mkdir -p ~/tools && cd ~/tools
-          
-          # Download ProjectDiscovery tools
+         
+          # Download ProjectDiscovery tools (original)
           for tool in "subfinder:2.12.0" "httpx:1.8.1" "nuclei:3.7.0" "katana:1.4.0" "naabu:2.4.0" "alterx:0.1.0"; do
             name=${tool%:*}
             ver=${tool#*:}
@@ -52,15 +51,33 @@ jobs:
             unzip -o -q "${name}_${ver}_linux_amd64.zip"
             rm "${name}_${ver}_linux_amd64.zip"
           done
-
-          # Download notify separately
+          # Download notify separately (original)
           wget -q "https://github.com/projectdiscovery/notify/releases/download/v1.0.7/notify_1.0.7_linux_amd64.zip"
           unzip -o -q notify_1.0.7_linux_amd64.zip
           rm notify_1.0.7_linux_amd64.zip
-          
+
+          # ── Added: waybackurls, gau, hakrawler ──
+          # waybackurls v0.1.0 (last binary release)
+          wget -q https://github.com/tomnomnom/waybackurls/releases/download/v0.1.0/waybackurls-linux-amd64-0.1.0.tgz
+          tar -xzf waybackurls-linux-amd64-0.1.0.tgz
+          mv waybackurls waybackurls
+          rm waybackurls-linux-amd64-0.1.0.tgz
+
+          # gau v2.2.4 (latest binary as of late 2024)
+          wget -q https://github.com/lc/gau/releases/download/v2.2.4/gau_2.2.4_linux_amd64.tar.gz
+          tar -xzf gau_2.2.4_linux_amd64.tar.gz
+          mv gau waybackurls/gau || mv gau ~/tools/gau
+          rm gau_2.2.4_linux_amd64.tar.gz
+
+          # hakrawler v2.1 (last release)
+          wget -q https://github.com/hakluke/hakrawler/releases/download/2.1/hakrawler_2.1_Linux_x86_64.tar.gz
+          tar -xzf hakrawler_2.1_Linux_x86_64.tar.gz
+          mv hakrawler ~/tools/hakrawler
+          rm hakrawler_2.1_Linux_x86_64.tar.gz LICENSE README.md
+         
           chmod +x *
-          echo "Tools installed"
-          
+          echo "Tools installed (including waybackurls, gau, hakrawler)"
+         
       - name: Setup PATH
         run: |
           echo "$HOME/tools" >> $GITHUB_PATH
@@ -71,7 +88,10 @@ jobs:
           ~/tools/naabu -version
           ~/tools/alterx -version
           ~/tools/notify -version
-          
+          ~/tools/waybackurls --version || echo "waybackurls ready"
+          ~/tools/gau --version || echo "gau ready"
+          ~/tools/hakrawler --version || echo "hakrawler ready"
+         
       - name: Cache templates
         id: cache-templates
         uses: actions/cache@v4
@@ -79,11 +99,11 @@ jobs:
           path: nuclei-templates
           key: nuclei-templates-${{ github.run_id }}
           restore-keys: nuclei-templates-
-          
-      - name:  Clone templates
+         
+      - name: Clone templates
         if: steps.cache-templates.outputs.cache-hit != 'true'
         run: git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates.git
-          
+         
       - name: Setup notify
         env:
           TELEGRAM_API_KEY: ${{ secrets.TELEGRAM_API_KEY }}
@@ -94,11 +114,11 @@ jobs:
             - id: "tel"
               telegram_api_key: "$TELEGRAM_API_KEY"
               telegram_chat_id: "$TELEGRAM_CHAT_ID"
-              telegram_format:  "{{data}}"
+              telegram_format: "{{data}}"
               telegram_parsemode: "Markdown"
           EOF
-          
-      - name:  Verify input
+         
+      - name: Verify input
         run: |
           [[ -f "upload/${{ inputs.file_name }}" ]] || {
             echo "Error: File not found: upload/${{ inputs.file_name }}"
@@ -106,29 +126,77 @@ jobs:
             exit 1
           }
           echo "Input file: upload/${{ inputs.file_name }} ($(wc -l < upload/${{ inputs.file_name }}) lines)"
-          
-      - name:  Execute scan
+         
+      - name: Gather URLs from domains (waybackurls + gau + hakrawler + katana)
         env:
           TELEGRAM_API_KEY: ${{ secrets.TELEGRAM_API_KEY }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          FILE="upload/${{ inputs.file_name }}"
+          INPUT_FILE="upload/${{ inputs.file_name }}"
+          UNIQUE_URLS="uniqueurls.txt"
+          TEMP_FILE="urls.tmp"
+
+          > "$UNIQUE_URLS"
+          > "$TEMP_FILE"
+
+          echo "Starting parallel URL gathering..."
+
+          while IFS= read -r domain; do
+            echo "→ $domain"
+            ~/tools/waybackurls "$domain" >> "$TEMP_FILE" 2>/dev/null &
+            ~/tools/gau "$domain" >> "$TEMP_FILE" 2>/dev/null &
+            ~/tools/hakrawler -plain -url "$domain" >> "$TEMP_FILE" 2>/dev/null &
+            ~/tools/katana -u "$domain" -silent >> "$TEMP_FILE" 2>/dev/null &
+            wait
+          done < "$INPUT_FILE"
+
+          if [[ -s "$TEMP_FILE" ]]; then
+            sort -u "$TEMP_FILE" | grep -E '^https?://' > "$UNIQUE_URLS"
+            rm "$TEMP_FILE"
+          fi
+
+          COUNT=$(wc -l < "$UNIQUE_URLS" 2>/dev/null || echo 0)
+          echo "Gathered $COUNT unique URLs"
+
+          if [[ $COUNT -gt 0 ]]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_API_KEY}/sendMessage" \
+              -d "chat_id=${TELEGRAM_CHAT_ID}" \
+              -d "text=🔍 Gathered $COUNT unique URLs from archives & crawl" || true
+          else
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_API_KEY}/sendMessage" \
+              -d "chat_id=${TELEGRAM_CHAT_ID}" \
+              -d "text=⚠️ No URLs gathered — using original input" || true
+          fi
+         
+      - name: Execute scan
+        env:
+          TELEGRAM_API_KEY: ${{ secrets.TELEGRAM_API_KEY }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          # Prefer gathered URLs if available
+          if [[ -s uniqueurls.txt ]]; then
+            FILE="uniqueurls.txt"
+            echo "Using gathered uniqueurls.txt for scan"
+          else
+            FILE="upload/${{ inputs.file_name }}"
+            echo "No gathered URLs — using original input file"
+          fi
+
           CMD="${{ inputs.command }}"
           MODE="${{ inputs.notification_mode }}"
           BULK="${{ inputs.bulk_filename }}"
-          
+         
           echo "Starting scan: $(date)"
-          
+         
           if [[ "$MODE" == "bulk" ]]; then
             cat "$FILE" | eval "$CMD" > "$BULK" && {
               [[ -s "$BULK" ]] && {
                 LINES=$(wc -l < "$BULK")
                 echo "Results: $LINES lines"
-                # Send file as document to Telegram
                 curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_API_KEY}/sendDocument" \
                   -F "chat_id=${TELEGRAM_CHAT_ID}" \
                   -F "document=@${BULK}" \
-                  -F "caption=✅ Scan completed: ${LINES} results" && echo "File sent to Telegram"
+                  -F "caption=✅ Scan completed: ${LINES} results" && echo "File sent"
               } || {
                 curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_API_KEY}/sendMessage" \
                   -d "chat_id=${TELEGRAM_CHAT_ID}" \
@@ -146,9 +214,9 @@ jobs:
               exit 1
             }
           fi
-          
+         
           echo "Completed: $(date)"
-          
+         
       - name: Upload results
         if: inputs.notification_mode == 'bulk'
         uses: actions/upload-artifact@v4
@@ -156,10 +224,11 @@ jobs:
           name: scan-results
           path: ${{ inputs.bulk_filename }}
           retention-days: 7
-          
+         
       - name: Cleanup
         if: always()
         run: |
           rm -f notify.yml
           rm -f ${{ inputs.bulk_filename }} 2>/dev/null || true
+          rm -f uniqueurls.txt urls.tmp 2>/dev/null || true
           rm -rf nuclei-templates
